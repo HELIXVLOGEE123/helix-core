@@ -173,6 +173,9 @@ reaching the platform, and both expose interfaces exclusively.
       │
       │  onDestroy()
       ▼
+   DESTROYING ──(throws)──► FAILED
+      │
+      ▼
    DESTROYED   (terminal — no further transitions)
 ```
 

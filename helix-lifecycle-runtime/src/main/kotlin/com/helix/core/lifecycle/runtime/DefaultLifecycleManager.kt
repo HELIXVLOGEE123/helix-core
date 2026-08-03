@@ -54,7 +54,7 @@ public class DefaultLifecycleManager(
         eventBus.publish(ComponentStoppedEvent(name))
     }
 
-    override fun destroyAll() = runPhase(LifecycleState.STOPPING, forward = false) { _, entry ->
+    override fun destroyAll() = runPhase(LifecycleState.DESTROYING, forward = false) { _, entry ->
         entry.component.onDestroy()
     }
 

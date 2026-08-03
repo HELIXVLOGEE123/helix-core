@@ -13,6 +13,7 @@ public enum class LifecycleState {
     RUNNING,
     STOPPING,
     STOPPED,
+    DESTROYING,
     DESTROYED,
     FAILED
 }

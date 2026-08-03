@@ -46,6 +46,7 @@ public abstract class BaseLifecycleComponent : LifecycleAware {
 
     final override fun onDestroy() {
         if (state == LifecycleState.DESTROYED) return
+        state = LifecycleState.DESTROYING
         doDestroy()
         state = LifecycleState.DESTROYED
     }
