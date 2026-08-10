@@ -28,11 +28,11 @@ public class DefaultPluginManager(
 
     override fun loadPlugin(plugin: HelixPlugin) {
         val descriptor = plugin.descriptor
-        val missingDeps = descriptor.dependsOn.filterNot { it in loaded }
+        val missingDeps = descriptor.dependsOn.filterNot { loaded.containsKey(it) }
         require(missingDeps.isEmpty()) {
             "Cannot load plugin '${descriptor.id}': missing dependencies $missingDeps"
         }
-        require(descriptor.id !in loaded) { "Plugin '${descriptor.id}' is already loaded" }
+        require(!loaded.containsKey(descriptor.id)) { "Plugin '${descriptor.id}' is already loaded" }
 
         try {
             plugin.onLoad(pluginContext)

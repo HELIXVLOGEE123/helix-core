@@ -29,7 +29,7 @@ public class DefaultEventBus(
     private val typeSubscribers = ConcurrentHashMap<KClass<*>, CopyOnWriteArrayList<HandlerSubscription<*>>>()
     private val topicSubscribers = CopyOnWriteArrayList<TopicSubscription>()
 
-    override fun publish(event: HelixEvent) = dispatch(event)
+    override fun publish(event: HelixEvent): Unit = dispatch(event)
 
     override fun publishAsync(event: HelixEvent) {
         asyncExecutor.submit { dispatch(event) }

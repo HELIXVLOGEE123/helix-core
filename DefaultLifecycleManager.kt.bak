@@ -39,22 +39,22 @@ public class DefaultLifecycleManager(
         entries[name] = Entry(component, dependsOn)
     }
 
-    override fun initAll(): Unit = runPhase(LifecycleState.INITIALIZING, forward = true) { name, entry ->
+    override fun initAll() = runPhase(LifecycleState.INITIALIZING, forward = true) { name, entry ->
         entry.component.onInit(context)
         eventBus.publish(ComponentInitializedEvent(name))
     }
 
-    override fun startAll(): Unit = runPhase(LifecycleState.STARTING, forward = true) { name, entry ->
+    override fun startAll() = runPhase(LifecycleState.STARTING, forward = true) { name, entry ->
         entry.component.onStart()
         eventBus.publish(ComponentStartedEvent(name))
     }
 
-    override fun stopAll(): Unit = runPhase(LifecycleState.STOPPING, forward = false) { name, entry ->
+    override fun stopAll() = runPhase(LifecycleState.STOPPING, forward = false) { name, entry ->
         entry.component.onStop()
         eventBus.publish(ComponentStoppedEvent(name))
     }
 
-    override fun destroyAll(): Unit = runPhase(LifecycleState.DESTROYING, forward = false) { _, entry ->
+    override fun destroyAll() = runPhase(LifecycleState.DESTROYING, forward = false) { _, entry ->
         entry.component.onDestroy()
     }
 
