@@ -10,101 +10,309 @@ import com.helix.core.lifecycle.api.LifecycleContext
 import com.helix.core.lifecycle.api.LifecycleManager
 import com.helix.core.lifecycle.api.LifecycleState
 import com.helix.core.logging.api.LoggerFactory
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
-/**
- * Default [LifecycleManager]. Components are topologically sorted by their
- * declared `dependsOn` edges (Kahn's algorithm); init/start run in that
- * order, stop/destroy run in reverse. A cycle in the dependency graph is a
- * programming error and fails fast at [initAll] time with a clear message.
- *
- * Failure policy: if a component throws during onInit/onStart, it is marked
- * FAILED, a [ComponentFailedEvent] is published, and the manager continues
- * with remaining components rather than aborting the whole platform boot —
- * callers that need fail-fast semantics should subscribe to
- * ComponentFailedEvent and decide themselves whether to halt.
- */
 public class DefaultLifecycleManager(
     private val context: LifecycleContext,
-    private val eventBus: EventBus,
+    private val eventBus: EventBus = context.eventBus,
     loggerFactory: LoggerFactory
 ) : LifecycleManager {
 
+    private val lock = ReentrantLock()
+
     private val logger = loggerFactory.getLogger("helix.lifecycle")
-    private val entries = LinkedHashMap<String, Entry>()
 
-    private class Entry(val component: LifecycleAware, val dependsOn: List<String>)
+    private data class Registration(
+        val name: String,
+        val component: LifecycleAware,
+        val dependsOn: List<String>
+    )
 
-    override fun register(name: String, component: LifecycleAware, dependsOn: List<String>) {
-        require(name !in entries) { "Component '$name' is already registered" }
-        entries[name] = Entry(component, dependsOn)
-    }
+    private val registrations = LinkedHashMap<String, Registration>()
 
-    override fun initAll(): Unit = runPhase(LifecycleState.INITIALIZING, forward = true) { name, entry ->
-        entry.component.onInit(context)
-        eventBus.publish(ComponentInitializedEvent(name))
-    }
+    private var managerState = LifecycleState.CREATED
 
-    override fun startAll(): Unit = runPhase(LifecycleState.STARTING, forward = true) { name, entry ->
-        entry.component.onStart()
-        eventBus.publish(ComponentStartedEvent(name))
-    }
+    public val state: LifecycleState
+        get() = lock.withLock { managerState }
 
-    override fun stopAll(): Unit = runPhase(LifecycleState.STOPPING, forward = false) { name, entry ->
-        entry.component.onStop()
-        eventBus.publish(ComponentStoppedEvent(name))
-    }
-
-    override fun destroyAll(): Unit = runPhase(LifecycleState.DESTROYING, forward = false) { _, entry ->
-        entry.component.onDestroy()
-    }
-
-    override fun stateOf(name: String): LifecycleState? = entries[name]?.component?.state
-
-    override fun registeredComponentNames(): List<String> = topologicalOrder()
-
-    private inline fun runPhase(
-        phase: LifecycleState,
-        forward: Boolean,
-        action: (String, Entry) -> Unit
+    override fun register(
+        name: String,
+        component: LifecycleAware,
+        dependsOn: List<String>
     ) {
-        val order = topologicalOrder().let { if (forward) it else it.asReversed() }
-        for (name in order) {
-            val entry = entries.getValue(name)
+        lock.withLock {
+            check(
+                managerState == LifecycleState.CREATED ||
+                managerState == LifecycleState.INITIALIZED ||
+                managerState == LifecycleState.STOPPED
+            ) {
+                "Cannot register component '$name' when LifecycleManager is in state $managerState"
+            }
+
+            check(name !in registrations) {
+                "Component '$name' is already registered"
+            }
+
+            registrations[name] = Registration(
+                name = name,
+                component = component,
+                dependsOn = dependsOn.toList()
+            )
+        }
+    }
+
+    override fun initAll() {
+        lock.withLock {
+            check(managerState == LifecycleState.CREATED) {
+                "Cannot execute initAll when LifecycleManager is in state $managerState"
+            }
+
+            managerState = LifecycleState.INITIALIZING
+
             try {
-                action(name, entry)
+                val ordered = topologicalOrder()
+
+                for (registration in ordered) {
+                    try {
+                        registration.component.onInit(context)
+
+                        eventBus.publish(
+                            ComponentInitializedEvent(registration.name)
+                        )
+                    } catch (t: Throwable) {
+                        eventBus.publish(
+                            ComponentFailedEvent(
+                                registration.name,
+                                registration.component.state,
+                                t.message ?: t::class.simpleName.orEmpty()
+                            )
+                        )
+
+                        throw t
+                    }
+                }
+
+                managerState = LifecycleState.INITIALIZED
             } catch (t: Throwable) {
-                logger.error("Component '$name' failed during $phase", throwable = t)
-                eventBus.publish(ComponentFailedEvent(name, phase, t.message ?: t::class.simpleName.orEmpty()))
+                managerState = LifecycleState.FAILED
+                throw t
             }
         }
     }
 
-    /** Kahn's algorithm; throws IllegalStateException with the offending component names if a cycle is detected. */
-    private fun topologicalOrder(): List<String> {
-        val inDegree = entries.mapValues { (_, entry) -> entry.dependsOn.size }.toMutableMap()
-        val dependents = mutableMapOf<String, MutableList<String>>()
-        for ((name, entry) in entries) {
-            for (dep in entry.dependsOn) {
-                require(dep in entries) { "Component '$name' depends on unregistered component '$dep'" }
-                dependents.getOrPut(dep) { mutableListOf() }.add(name)
+    override fun startAll() {
+        lock.withLock {
+            check(
+                managerState == LifecycleState.INITIALIZED ||
+                managerState == LifecycleState.STOPPED
+            ) {
+                "Cannot execute startAll when LifecycleManager is in state $managerState"
+            }
+
+            managerState = LifecycleState.STARTING
+
+            val ordered = topologicalOrder()
+            val started = mutableListOf<Registration>()
+
+            try {
+                for (registration in ordered) {
+                    try {
+                        registration.component.onStart()
+
+                        started.add(registration)
+
+                        eventBus.publish(
+                            ComponentStartedEvent(registration.name)
+                        )
+                    } catch (t: Throwable) {
+                        eventBus.publish(
+                            ComponentFailedEvent(
+                                registration.name,
+                                registration.component.state,
+                                t.message ?: t::class.simpleName.orEmpty()
+                            )
+                        )
+
+                        throw t
+                    }
+                }
+
+                managerState = LifecycleState.RUNNING
+            } catch (t: Throwable) {
+
+                // Roll back components that successfully started.
+                for (registration in started.asReversed()) {
+                    try {
+                        registration.component.onStop()
+
+                        eventBus.publish(
+                            ComponentStoppedEvent(registration.name)
+                        )
+                    } catch (rollbackError: Throwable) {
+                        logger.error(
+                            "Error stopping component '${registration.name}' during startup rollback",
+                            rollbackError
+                        )
+                    }
+                }
+
+                managerState = LifecycleState.FAILED
+                throw t
+            }
+        }
+    }
+
+    override fun stopAll() {
+        lock.withLock {
+            check(managerState == LifecycleState.RUNNING) {
+                "Cannot execute stopAll when LifecycleManager is in state $managerState"
+            }
+
+            managerState = LifecycleState.STOPPING
+
+            try {
+                for (registration in topologicalOrder().asReversed()) {
+                    try {
+                        registration.component.onStop()
+
+                        eventBus.publish(
+                            ComponentStoppedEvent(registration.name)
+                        )
+                    } catch (t: Throwable) {
+                        eventBus.publish(
+                            ComponentFailedEvent(
+                                registration.name,
+                                registration.component.state,
+                                t.message ?: t::class.simpleName.orEmpty()
+                            )
+                        )
+
+                        throw t
+                    }
+                }
+
+                managerState = LifecycleState.STOPPED
+            } catch (t: Throwable) {
+                managerState = LifecycleState.FAILED
+                throw t
+            }
+        }
+    }
+
+    override fun destroyAll() {
+        lock.withLock {
+            check(
+                managerState == LifecycleState.INITIALIZED ||
+                managerState == LifecycleState.STOPPED ||
+                managerState == LifecycleState.FAILED ||
+                managerState == LifecycleState.CREATED
+            ) {
+                "Cannot execute destroyAll when LifecycleManager is in state $managerState"
+            }
+
+            managerState = LifecycleState.DESTROYING
+
+            try {
+                for (registration in topologicalOrder().asReversed()) {
+                    try {
+                        registration.component.onDestroy()
+                    } catch (t: Throwable) {
+                        eventBus.publish(
+                            ComponentFailedEvent(
+                                registration.name,
+                                registration.component.state,
+                                t.message ?: t::class.simpleName.orEmpty()
+                            )
+                        )
+
+                        throw t
+                    }
+                }
+
+                managerState = LifecycleState.DESTROYED
+            } catch (t: Throwable) {
+                managerState = LifecycleState.FAILED
+                throw t
+            }
+        }
+    }
+
+    override fun stateOf(name: String): LifecycleState? {
+        return lock.withLock {
+            registrations[name]?.component?.state
+        }
+    }
+
+    override fun registeredComponentNames(): List<String> {
+        return lock.withLock {
+            registrations.keys.toList()
+        }
+    }
+
+    /**
+     * Returns components in dependency-first order.
+     *
+     * If A depends on B, B appears before A.
+     */
+    private fun topologicalOrder(): List<Registration> {
+
+        val inDegree = LinkedHashMap<String, Int>()
+        val dependents = LinkedHashMap<String, MutableList<String>>()
+
+        for (name in registrations.keys) {
+            inDegree[name] = 0
+            dependents[name] = mutableListOf()
+        }
+
+        for (registration in registrations.values) {
+            for (dependency in registration.dependsOn) {
+
+                check(dependency in registrations) {
+                    "Missing dependency '$dependency' required by component '${registration.name}'"
+                }
+
+                inDegree[registration.name] =
+                    inDegree.getValue(registration.name) + 1
+
+                dependents.getValue(dependency).add(registration.name)
             }
         }
 
-        val queue = ArrayDeque(inDegree.filterValues { it == 0 }.keys)
-        val order = mutableListOf<String>()
+        val queue = ArrayDeque<String>()
+
+        for ((name, degree) in inDegree) {
+            if (degree == 0) {
+                queue.addLast(name)
+            }
+        }
+
+        val sortedNames = mutableListOf<String>()
+
         while (queue.isNotEmpty()) {
             val name = queue.removeFirst()
-            order.add(name)
-            for (dependent in dependents[name].orEmpty()) {
-                inDegree[dependent] = inDegree.getValue(dependent) - 1
-                if (inDegree.getValue(dependent) == 0) queue.addLast(dependent)
+
+            sortedNames.add(name)
+
+            for (dependent in dependents.getValue(name)) {
+                val newDegree =
+                    inDegree.getValue(dependent) - 1
+
+                inDegree[dependent] = newDegree
+
+                if (newDegree == 0) {
+                    queue.addLast(dependent)
+                }
             }
         }
 
-        check(order.size == entries.size) {
-            val cyclic = entries.keys - order.toSet()
-            "Cyclic dependency detected among lifecycle components: $cyclic"
+        check(sortedNames.size == registrations.size) {
+            val cyclic = registrations.keys
+                .filterNot { it in sortedNames }
+
+            "Circular dependency detected: $cyclic"
         }
-        return order
+
+        return sortedNames.map { registrations.getValue(it) }
     }
 }

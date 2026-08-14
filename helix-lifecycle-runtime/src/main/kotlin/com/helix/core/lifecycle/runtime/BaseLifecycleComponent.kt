@@ -3,56 +3,100 @@ package com.helix.core.lifecycle.runtime
 import com.helix.core.lifecycle.api.LifecycleAware
 import com.helix.core.lifecycle.api.LifecycleContext
 import com.helix.core.lifecycle.api.LifecycleState
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Convenience base class for platform components: handles state transitions
- * and guards against invalid calls (e.g. onStart before onInit) so concrete
- * components only need to implement the four `do*` hooks. Not mandatory —
- * any class can implement [LifecycleAware] directly — but recommended for
- * consistency across the codebase (see docs/CODING_STANDARDS.md).
+ * Convenience base class for platform components.
+ *
+ * Handles lifecycle state transitions and automatically moves a component
+ * into FAILED when a lifecycle hook throws.
  */
 public abstract class BaseLifecycleComponent : LifecycleAware {
 
-    @Volatile
-    final override var state: LifecycleState = LifecycleState.CREATED
-        private set
+    private val stateRef = AtomicReference(LifecycleState.CREATED)
+
+    final override val state: LifecycleState
+        get() = stateRef.get()
 
     protected lateinit var context: LifecycleContext
         private set
 
     final override fun onInit(context: LifecycleContext) {
-        check(state == LifecycleState.CREATED) { "onInit called from invalid state $state" }
-        state = LifecycleState.INITIALIZING
-        this.context = context
-        doInit(context)
-        state = LifecycleState.INITIALIZED
+        transitionTo(LifecycleState.INITIALIZING)
+
+        try {
+            this.context = context
+            doInit(context)
+            transitionTo(LifecycleState.INITIALIZED)
+        } catch (t: Throwable) {
+            transitionToFailed()
+            throw t
+        }
     }
 
     final override fun onStart() {
-        check(state == LifecycleState.INITIALIZED || state == LifecycleState.STOPPED) {
-            "onStart called from invalid state $state"
+        transitionTo(LifecycleState.STARTING)
+
+        try {
+            doStart()
+            transitionTo(LifecycleState.RUNNING)
+        } catch (t: Throwable) {
+            transitionToFailed()
+            throw t
         }
-        state = LifecycleState.STARTING
-        doStart()
-        state = LifecycleState.RUNNING
     }
 
     final override fun onStop() {
-        if (state != LifecycleState.RUNNING) return
-        state = LifecycleState.STOPPING
-        doStop()
-        state = LifecycleState.STOPPED
+        transitionTo(LifecycleState.STOPPING)
+
+        try {
+            doStop()
+            transitionTo(LifecycleState.STOPPED)
+        } catch (t: Throwable) {
+            transitionToFailed()
+            throw t
+        }
     }
 
     final override fun onDestroy() {
-        if (state == LifecycleState.DESTROYED) return
-        state = LifecycleState.DESTROYING
-        doDestroy()
-        state = LifecycleState.DESTROYED
+        transitionTo(LifecycleState.DESTROYING)
+
+        try {
+            doDestroy()
+            transitionTo(LifecycleState.DESTROYED)
+        } catch (t: Throwable) {
+            transitionToFailed()
+            throw t
+        }
     }
 
     protected open fun doInit(context: LifecycleContext) {}
+
     protected open fun doStart() {}
+
     protected open fun doStop() {}
+
     protected open fun doDestroy() {}
+
+    private fun transitionTo(target: LifecycleState) {
+        stateRef.updateAndGet { current ->
+            check(current.canTransitionTo(target)) {
+                "Invalid lifecycle state transition: $current -> $target"
+            }
+            target
+        }
+    }
+
+    private fun transitionToFailed() {
+        stateRef.updateAndGet { current ->
+            if (current == LifecycleState.FAILED) {
+                current
+            } else {
+                check(current.canTransitionTo(LifecycleState.FAILED)) {
+                    "Cannot transition lifecycle component from $current to FAILED"
+                }
+                LifecycleState.FAILED
+            }
+        }
+    }
 }
